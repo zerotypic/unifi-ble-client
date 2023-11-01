@@ -1,0 +1,499 @@
+# UniFi BLE Protocol
+
+This document describes the BLE protocol used by UniFi devices. It is largely based on reverse engineering of the UniFi Protect android app (`com.ubnt.unifi.protect`). It is thus currently specific to UniFi Protect devices, but based on the code, we suspect it is probably generic enough to work with other UniFi devices as well, e.g. AmpliFi. However, we have not looked at any other devices as of yet.
+
+
+## Overview
+
+Some UniFi devices are designed to have their initial configuration sent to them via Bluetooth. For such devices, the process of adopting them into a network begins with running the UniFi app on a mobile device, locating the device on the app, and then configuring the device via the app with WiFi credentials and the IP address of the network's UniFi controller. XXX
+
+The UniFi BLE protocol is (obviously) built on top of BLE. The protocol consists of two endpoints, the *host* mobile app, and the *device* being adopted.
+
+There are 4 layers to the protocol:
+
+-   BLE layer
+-   Packet layer
+-   Auth message layer / API message layer
+
+Encryption happens at the packet layer. Encryption key exchange uses *auth messages*, which are above the packet layer, on a layer adjacent to the API message layer.
+
+
+## BLE Layer
+
+The BLE layer provides the higher layers with the ability to read and write data streams between host and device. It talks directly to the BLE stack on host and device. The host first establishes a BLE connection with the device. Communications then occur via a specific BLE service, whose UUID depends on the device model. The service contains two characteristics: a *read* characteristic and a *write* characteristic. These have fixed UUIDs.
+
+-   **Read characteristic**: `d587c47f-ac6e-4388-a31c-e6cd380ba043`
+    -   Used to send data from the device to the host.
+    -   Host will receive a BLE notification when data is sent from the device.
+    -   Incoming data is a stream, broken up into BLE characteristic values whose size depends on the negotiated MTU. The host must reassemble the data stream.
+-   **Write characteristic**: `9280f26c-a56f-43ea-b769-d5d732e1ac67`
+    -   Used to send data from the host to the device.
+    -   Needs to be a "write with response" operation.
+    -   Data is written as a stream, broken up into BLE characteristic values whose size depends on the negotiated MTU.
+
+
+## Packet Layer
+
+The packet layer operates on top of the BLE layer. It provides a mechanism to send and receive *packets*, which are arbitrarily sized data buffers. In addition, packets are encrypted using a shared secret key, and a key exchange protocol is used during connection to create a shared key. These *encrypted packets* are then read from or written to the BLE layer data streams.
+
+**Note that all numerical values used in this layer are encoded in big-endian.**
+
+
+### Encrypted Packet
+
+The layout of an *encrypted packet* is as follows:
+
+| 2    | ~              |
+| size | encrypted data |
+
+-   *size* (unsigned short) is the total number of bytes forming the encrypted packet, including the size field itself.
+-   *encrypted data* (variable length bytestring) is the encrypted payload itself, which can be decrypted to yield the plaintext packet.
+
+Packet encryption and decryption are described later in this document.
+
+
+### Plaintext Packet
+
+The layout of a *plaintext packet* is as follows:
+
+| 2               | 1        | ~    |
+| sequence number | protocol | data |
+
+-   *sequence number* (unsigned short) is the packet's sequence number. The protocol enforces ordering of packets using the sequence number.
+-   *protocol* (byte) is the protocol specifier, indicating the type of message contained within this packet. It is unknown what all the possible values of this specifier are; however the following values are known:
+    -   `0` for auth messages (key exchange)
+    -   `3` for API messages
+-   *data* (variable length bytestream) is the contents forming the higher layer message.
+
+
+### Keys and Encryption
+
+The protocol maintains a set of keys to use for encryption and decryption:
+
+-   *send key*: shared secret key used to encrypt data to be sent.
+-   *receive key*: shared secret key used to decrypt data that was received.
+-   *auth key*: usually not set, otherwise, used during shared key calculation.
+
+In practice, the *send key* and *receive key* are usually the same shared secret key that was calculated during key exchange.
+
+The encrypted data is encrypted using Sodium (<https://doc.libsodium.org/>):
+
+-   Uses API function `Sodium.crypto_secretbox_easy`.
+-   Entire plaintext packet is encrypted.
+-   Nonce is a 24-byte value consisting of the 2-byte sequence number followed by 22 null bytes.
+-   The *send key* is used for encryption, and the *receive key* is used for decryption.
+-   Note: the final size of the encrypted packet data is the size of the plaintext packet, plus `Sodium.crypto_box_maxbytes()`.
+
+
+### Sequence Numbers
+
+The packet layer keeps track of sequence numbers. There are two sequence numbers, the *send sequence number* and the *receive sequence number*. Both are initially set to 0. The send sequence number is incremented each time a packet is sent, and the receive sequence number is incremented each time a packet is received. Maintaining the sequence numbers is important as it is used in calculating the nonce for encryption/decryption; an invalid sequence number would prevent encrypted packets from being successfully decrypted.
+
+
+## Key Exchange
+
+Immediately after a BLE connection is established between the host and device, key exchange must take place. This exchange takes place using auth messages, which are sent via the packet layer.
+
+The key exchange phase is based on Diffie-Helman key exchange, and will calculate a shared secret key between the host and device, which is then used as the *send key* and *receive key* for encryption. Subsequent communications will all take place using this key.
+
+Since the packet layer always encrypts packets before sending, the initial auth messages need to be encrypted as well. As such, during initialization the send and receive keys are both set to a *default key*. The value of the default key was found by reversing the mobile app:
+
+```python
+DEFAULT_KEY = \
+    b"\xa7\x81\xf8\xa4\xa6\x27\x37\x3b\x70\x74\x57\x38\xcd\xff\xdd\x1d" + \
+    b"\xe9\xae\x35\x25\x17\xc3\x74\xca\x9a\xfc\x21\x5c\x39\xc6\x26\x37"
+```
+
+The key exchange consists of the following steps:
+
+1.  Host and device generate Diffie-Helman keypairs.
+2.  Host sends host's public key to device via a DH public key message.
+3.  Device sends device's public key to host via a DH public key message.
+4.  Both sides calculate a shared secret key.
+5.  Device sends an auth OK message.
+6.  Host sends an auth OK message.
+7.  Both sides use the shared secret key for subsequent communications.
+
+
+### Auth Message Format
+
+Auth messages are sent out over the packet layer, with a protocol specifier of 0. The contents of the message is structured data, encoded into a bytestream using MessagePack (<https://msgpack.org/>).
+
+There are two different types of auth messages: DH public key messages, and auth OK messages.
+
+1.  DH Public Key Message
+
+    This message is used to send the Diffie-Helman public key to the other endpoint. It is a MessagePack-encoded structured object of the form:
+    
+    -   Array containing 3 values:
+        -   Literal string value "DHPK"
+        -   Boolean value "false"
+        -   Binary data consisting of the public key
+
+2.  Auth OK Message
+
+    This message is used to indicate to the other endpoint that the shared secret key was successfully computed. It is a MessagePack-encoded structured object of the form:
+    
+    -   Array containing 2 values:
+        -   Literal string value "AUTH"
+        -   Literal string value "DH"
+    
+    Note: According to the code in the mobile app, another acceptable response for the second value above is "SRP", but we are not sure what that is used for.
+
+
+### DH Keypair Generation
+
+During initialization, both host and device generate a Diffie-Helman public-private keypair. On the host, this is done using the Sodium library, with the private key consisting of randomly generate bytes (`Sodium.randombytes()`), and the public key generated from the private key using `Sodium.crypto_scalarmult_base()`.
+
+Note 1: based on code in class `com.ubnt.ble.auth.DiffieHellmanAuth`.
+
+Note 2: In Python, using the *nacl* library, the `nacl.public.PrivateKey` class performs equivalent operations.
+
+
+### Shared Secret Calculation
+
+Once an endpoint has received the other endpoint's public key, it can use the endpoint's public key and its own private key to calculate the shared secret. The following method is from the `com.ubnt.ble.auth.DiffieHellmanAuth` class, which shows how the key is calculated:
+
+```java
+public byte[] generateDiffieHellmanSharedSecret(byte[] device_pubkey, byte[] auth_key) throws Exception {
+   int v = Sodium.crypto_scalarmult_bytes();
+   byte[] keymix = new byte[v];
+   int v1 = Sodium.crypto_scalarmult(keymix, this.mPrivateKey, device_pubkey);
+   if(v1 == 0) {
+      int keylen = Sodium.crypto_generichash_bytes();
+      byte[] sharedKey = new byte[keylen];
+      byte[] hashstate = new byte[Sodium.crypto_generichash_statebytes()];
+      Sodium.crypto_generichash_init(hashstate, new byte[0], 0, keylen);
+      Sodium.crypto_generichash_update(hashstate, keymix, v);
+      Sodium.crypto_generichash_update(hashstate, this.mPublicKey, this.mPublicKey.length);
+      Sodium.crypto_generichash_update(hashstate, device_pubkey, device_pubkey.length);
+      if(auth_key != null) {
+         Sodium.crypto_generichash_blake2b_update(hashstate, auth_key, auth_key.length);
+      }
+
+      Sodium.crypto_generichash_final(hashstate, sharedKey, keylen);
+      Timber.d("sharedKey: %s", new Object[]{ByteArray.toHexString(sharedKey)});
+      return sharedKey;
+   }
+
+   throw new Exception("Crypto scalarmult error: " + v1);
+}
+```
+
+The `auth_key` passed in as a parameter is usually `null` based on our observations of the app.
+
+
+## API Message Layer
+
+Once key exchange is completed, messages on the API message layer can be sent. Messages at this layer are sent via the packet layer, with a protocol specifier of 3.
+
+The API message layer is designed to emulate a HTTP client-server model, with the host acting as the requesting client, and the device acting as the responding server. In general, all transactions take place with the host first sending a request message, followed by the device sending a response message. Request and responses also have a similar structure to HTTP: headers, methods, paths, status codes, etc.
+
+
+### API message format
+
+API messages consist of two sections, known as *message parts*. The first message part is the *header*, and the second is the *body*. The two message parts are concatenated together to form the data that is sent over the packet layer.
+
+1.  Message part format
+
+    A message part has the following layout:
+    
+    | 1    | 1      | 1        | 1    | 2      | ~    |
+    | type | format | compress | NULL | length | data |
+    
+    -   *type* (byte) is either 1 for header or 2 for body
+    -   *format* (byte) indicates the format of *data* stream:
+        -   JSON = 1, STRING = 2, BINARY = 3
+        -   Usually JSON
+    -   *compress* (byte) is a boolean value indicating whether or not *data* is compressed using zlib
+    -   *length* (unsigned big-endian short) is the length of *data*
+    -   *data* (variable length byte bytestream) is the actual contents of the message part.
+    
+    If *compress* is set, the data bytestream must be compressed using the zlib library.
+
+2.  Header part
+
+    The header message part has type 1 and format 1 (JSON). It is the equivalent of a HTTP header. It consists of a JSON object, which is encoded to form the message part's data stream.
+    
+    The header JSON object has a structure as follows:
+    
+    -   Object with key-value pairs:
+        -   `requestId` : request ID, integer, sequence number used by higher level code. Incremented with each request that is sent.
+        -   `type` : the literal string "request"
+        -   `method` : HTTP method string like `GET` or `POST`
+        -   `path` : HTTP path string like `/api/dostuff`
+        -   `headers` : Optional object containing additional headers, can be set to `null`.
+
+3.  Body part
+
+    The body message part has type 2 and format 1 (JSON). It is equivalent to the body of a HTTP request, and its contents depends on the request being made; it is returned verbatim to higher level code.
+
+
+### Sequence numbers
+
+Requests and responses are matched using the packet layer sequence numbers: the response to a request must have the same sequence number as the request. This means that in general, the send and receive sequence numbers on both endpoints need to be identical, i.e. the same number of messages should have been sent and received.
+
+Note: The reversed code also makes references to "events", which are possibly messages sent from the device to the host which are not part of the request/response sequence. The code takes this into consideration when comparing sequence numbers.
+
+
+## Example API Request
+
+Here's an example of how an API request gets ultimately sent over the BLE connection. The request we will use is to retrieve the device's access-point (AP) list.
+
+-   The request is made using the `GET` method to the path `/api/1.2/ap`. The header JSON is thus:
+    
+    ```javascript
+    {"requestId": 0, "type": "request", "method": "GET", "path": "/api/1.2/ap", "headers": null}
+    ```
+
+-   This JSON object is serialized into a byte stream, and then compressed using zlib, and used to build the header message part.
+
+-   There is no body, so the body message part consists only of the metadata values with a data length of 0.
+
+-   The two message parts are concatenated to form a single bytestream and passed to the packet layer.
+
+-   The packet layer prepends a sequence number and protocol (3 for API messages) to the bytestream.
+
+-   It then encrypts this stream using the send key.
+
+-   The encrypted stream is prepended with the size of the entire stream, and passed to the BLE layer.
+
+-   The BLE layer writes the bytestream to the service's write characteristic, and the data is sent to the device.
+
+-   The code now waits for the response message.
+
+-   At some point, the BLE layer receives a notification that there is data to be read from the read characteristic. It reads it and passes it to the packet layer.
+
+-   The packet layer waits till the data received consists of an entire packet, by using the size value.
+
+-   It then unencrypts the data using the receive key to yield the plaintext packet, which is parsed to obtain the data. If the protocol is set to 3, then this data is passed to the API message layer.
+
+-   The API message layer parses the data into the header and body message parts. It uncompresses and decodes both parts as required, yielding two JSON objects.
+
+-   The first is the JSON header, which will contain (among other fields), a `status` key that indicates the status code of the request. If it was successful, it should have a value of `200`.
+
+-   The second object is the body of the response, which in this case will be a JSON object containing the list of APs:
+    
+    ```javascript
+    { 'apList': [
+        {'authSuites': ['PSK'],
+         'channel': [1],
+         'encryption': 'wpa2',
+         'essid': 'somessid',
+         'frequency': ['2.4 GHz'],
+         'mac': ['aa:bb:cc:dd:ee:ff'],
+         'quality': '22/70',
+         'signalLevel': -88},
+        {'authSuites': ['PSK'],
+         'channel': [112],
+         'encryption': 'wpa2',
+         'essid': 'anotherssid',
+         'frequency': ['5 GHz'],
+         'mac': ['11:22:33:44:55:66'],
+         'quality': '23/70',
+         'signalLevel': -87},
+        ...
+    ]}
+    ```
+
+
+## Additional Notes from Reversing
+
+Here are some notes we made while reversing the UniFi mobile app (`com.ubnt.unifi.protect`, version 1.15.0). It's not really cleaned up, **so some of the information might actually be wrong**. Beware!
+
+
+### AdoptBleDeviceActivity
+
+-   Possibly the top-level code for adoption.
+-   Contains `observeAfvClient`, which returns an `AfvClient` that ultimately references `AmpliFiBle`, which contains the code to establish a connection with the server.
+-   It uses `AfvClientBle` to get access points on the device.
+-   Code then goes to `ManageBleDeviceWifiScannerFragment;->onAccessPointsReady()`, which should be displaying the list of found APs on the app, for the user to select the one to send.
+-   This should eventually lead to `AdoptBleDeviceActivity.sendWifiCredentials()`:
+    -   First call to `AfvClient.getCameraManagePayload()` to get manage payload.
+    -   Modify manage payload's wifi section to contain the wifi creds
+    -   Call `AfvClient.adoptDevice()` with the modified manage payload to send it to the device.
+-   That should be sufficient to get the device "adopted".
+
+
+### Connection Sequence
+
+-   Implemented in `AmpliFiBle`
+-   Connect to BLE device
+-   Go through authentication sequence
+-   Main loop:
+    -   `sendMessage()` is used to send a message to the device
+        -   Passed an `Emitter` which emits the result of the message when received.
+
+
+### Authentication Sequence
+
+-   Happens once the BLE connection is established.
+-   Runs `AuthTransaction`:
+    -   In object constructor, which runs before connect:
+        -   Sets `clientKey` to a new `DiffieHelmanAuth` object, and generates keys
+        -   See section on AuthTransaction below for more details.
+    -   `AuthTransaction.start()` runs:
+        -   Calls `.startTransaction()`:
+            -   Calls `AmpliFi.enableNotify()`:
+                -   Calls `BleDevice.enableNotify()`:
+                    -   Notify on READ<sub>UUID</sub>
+                    -   Callback is `notifyReadWriteListener`, which is an `AmpliFiBleParser`.
+                    -   See AmpliFiBleParser for more details.
+    -   Callback will receive initial event of type `INDICATION`, which is used to indicate that notification was turned on.
+        -   This will trigger code in AmpliFiBleParser, which will parse the data into a packet, if any (not in this initial case), and ultimately call `AuthTransaction.mNotifyObserver.onNext()`.
+        -   Eventually, `AuthTransaction.onNotify()` gets called:
+            -   The `INDICATION` event is probably `case 1`, calling `.sendDHPublicKey()`:
+                -   Sends the public key packed as a `DiffieHelmanPacket` to the device via WRITE<sub>UUID</sub>
+    -   The code now waits for a reply message from the device, which would be sent to the READ<sub>UUID</sub> and will again trigger a notification, ultimately calling `.onNotify()` again:
+        -   In this case, the event type is probably `case 2`, and results in a call to `.handleNotification()`:
+            -   `handleNotification()` will expect a `DiffieHelmanPacket` to have been returned, and parses this to obtain the public key of the device.
+    -   At this stage, we have sent our public key, and also obtained the device's public key. We thus have enough information to build the secret key.
+    -   The code will wait for another notification from the device, this time calling `.onNotify()` with an `AuthPacket`:
+        -   This will set `AuthState.mReceiveCryptKey` to `mCalculatedKey`.
+        -   Then, `sendAuthOk()` gets called:
+            -   Create an `AuthResultPacket`, containing some state info.
+            -   Sends this to device via WRITE<sub>UUID</sub>.
+            -   [callback] Once the packet was sent over successfully:
+                -   Set `AuthState.mSendCryptKey` to `mCalculatedKey`.
+                -   Call `.finishSucceed()`:
+                    -   Unsubscribe from READ<sub>UUID</sub> notifications.
+                    -   Tell underlying BLE layer that authentication was successful.
+    -   At this point, authentication has succeeded.
+
+
+### Adoption Sequence
+
+-   After authentication is complete, the device can be adopted by making a request to the following API endpoint:
+    
+    ```python
+    manage_payload = {
+        "mgmt" : {
+            "hosts" : [],
+            "protocol" : "http",
+            "token" : "XXXXXXXXXXXX",
+        },
+        "wifi" : {
+            "ssid" : "<SSID>",
+            "password" : "<PASSWORD>"
+        }
+    }
+    ad.request("/api/1.2/manage", method=adopter.MessageMethod.POST, payload=manage_payload)
+    ```
+-   This passes in a management *token*, which (I assume) the device will use to register itself with the actual controller running on the network.
+    -   This token, and the hosts and protocol values, are actually retrieved from the controller by the app, and then passed on to the device.
+-   Fortunately, the actual values don't matter; the device will first use the `wifi` section to connect to the WiFi network.
+-   Once this happens, the device can then be contacted using HTTP and SSH.
+
+
+### Request sending
+
+-   `Lcom/ubnt/net/client/BinmeRequestDelegate;->request()`
+-   First, a message is created:
+    -   The message consists of "parts", with 2 parts, 1 header and 1 body.
+        -   The header is a `RequestHeader` which contains a method (e.g. POST), path and type ("request").
+            -   Also contains any additional headers
+        -   The body is the payload, which contains things like the WiFi credentials
+            -   This is a JSON string, generated using Gson.
+    -   The parts are then serialized into byte streams
+        -   RequestHeader is seralized into JSON
+    -   Parts are then serialized using `Lcom/ubnt/net/message/BinmeMessageHelper;->writePart()` in this format:
+        -   1 byte type: HEADER `= 1, BODY =` 2
+        -   1 byte format: JSON == 1, which is what is used
+        -   1 byte compress: 1 if compressed
+        -   1 byte literal "\\0" byte
+        -   4 bytes integer length of data
+        -   data buffer, which in our case is a JSON string
+    -   This results in a single byte stream representing the message.
+-   The message is then sent out using `requestExecutor.request()`, which is `Lcom/ubnt/ble/AfvClientBle;->request()`:
+    -   A `BlePacket` is created:
+        -   `protocol =` 3
+        -   `data` is the message bytes from above
+        -   `sequence` is some sequence number taken from an associated `State` class
+    -   `Lcom/ubnt/ble/AmpliFiBle;->sendMessage()` is called with the packet:
+        -   Call `Lcom/ubnt/ble/packet/BlePacket;->packToBytes()` to further pack the message:
+            -   2 bytes `sequence`
+            -   1 byte `protocol`
+            -   data follows
+        -   `Lcom/ubnt/ble/packet/BlePacket;->encryptPacket()` is used to encrypt the packet:
+            -   Uses `State.AuthState.mSendCryptKey`
+        -   The final packed buffer is then:
+            -   2 bytes length: total length of encrypted packet bytes + 2
+            -   encrypted packet bytes follows
+        -   Write to BLE:
+            -   Use WRITE<sub>UUID</sub> characteristic
+            -   Set write type to 2
+            -   Write the final packed buffer in the appropriate way
+        -   After the write is completed, the response will be passed back via an async callback mechanism.
+            -   The callback mechanism works by registering the callback (SingleEmitter) in the `bleRequests` sparse array associated with the sequence number of the message. When the response is received and parsed (see AmpliFiBleParser section on `onBlePacket()`), the callback will then be called with the response.
+
+
+### AmpliFiBleParser
+
+-   This class processes data received from the device; it acts as a `ReadWriteListener` to the lower level BLE code.
+-   Starting point is `onEvent(ReadWriteEvent event)`:
+    -   `onBleNotification()` retrieves data from the device.
+        -   Appends data received till expected length is reached, determined by first 2 bytes which are assumed to be the length. Code here seems a bit fragile but probably not an issue.
+        -   Actual parsing happens in `BlePacket.parse()`:
+            -   Expected encrypted data format:
+                -   2 bytes length
+                -   Sodium crypto<sub>secretbox</sub><sub>easy</sub>() encrypted bytes follow
+            -   Expected cleartext data format:
+                -   2 bytes sequence number
+                -   1 byte protocol
+                -   Conditional contents:
+                    -   If protocol == 0:
+                        -   AuthPacket follows.
+                    -   Elif protocol != 1 and protocol != 2:
+                        -   BlePacket data follows.
+            -   AuthPacket format:
+                -   Jackson+MsgPack serialized buffer, of a list of values:
+                    -   Header string, either "AUTH" or "DHPK"
+                    -   If header is "DHPK":
+                        -   Boolean, must be true, used for DiffieHelmanPacket.isServer()
+                        -   byte[], length 0x20, bytes of the DH public key
+                        -   Returns `DiffieHelmanPacket`
+                    -   If header is "AUTH":
+                        -   String, auth type, either "DH"(0) or "SRP"(1).
+                        -   Returns `AuthResultPacket`
+        -   If a `BlePacket` was parsed from the data:
+            -   Sends packet to `AmpliFiBle.notifyReadWriteListener.OnBlePacketListener.onBlePacket()`:
+                -   This parses the packet data into a `SimpleResponse` object
+                -   Retrieves `SingleEmitter` associated with the response if any, and calls `onSuccess()` on the emitter.
+                -   Does some additional housekeeping as well to maintain sequence numbers.
+-   After `onBleNotification()` completes, create an (event, packet) pair.
+-   Send this to `this.eventReporter.onNext()`:
+    -   This is a pub-sub subject, which was passed in by the ctor.
+    -   Comes from `ApliFiBle`, set to `AmpliFiBle.notifyPublishSubject`
+    -   `ApliFiBle.subscribeToNotify()` can be used to subscribe to this subject.
+    -   Only statically detectable subscription is from `AuthTransaction`, which probably awaits the `AuthPackets` parsed in `onBleNotification()` and handles them.
+
+
+### Encryption and auth
+
+-   Seems to be setup by `AmpliFiBle`, inside the functions referring to "connecting" to the device.
+-   Look at `AuthTransaction` class.
+    -   DH is used to create a keypair.
+-   `mSendCryptKey` is used to encrypt the packet being sent to device:
+    -   Initial value is either recovery key passed in from higher levels, which doesn't seem to happen (it is set to null), or `DefaultAuth.DEFAULT_KEY`.
+    -   It gets set when `AuthState.applySendCryptKey()` is called, which sets its value `AuthState.mCalculatedKey`.
+    -   `mCalculatedKey` in turn gets set in `AuthTransaction.parseServerPublicKey()`, to the output of the function `LDiffieHellmanAuth.generateDiffieHellmanSharedSecret()`.
+    -   That function is part of the DH algo, generating the shared secret from the DH keys.
+-   `AuthTransaction`:
+    -   Gets created in `AmpliFiBle.connect()`.
+        -   Provided `authKey`, which appears to be null in most cases
+    -   In ctor, sets `AmpliFiBle.AuthState.mClientKey` to a new `DiffieHelmanAuth` object, and generates the pub and priv keys.
+    -   `onNotify()`: this gets called when there's a BLE event.
+        -   If the event type is 1 and was successful:
+            -   Calls `sendDHPublicKey()`:
+                -   `DiffieHelmanPacket.createPacket()`:
+                    -   Creates a `DiffieHelmanPacket`, which contains our public key, taken from `AuthState.mClientKey.mPublicKey`.
+                    -   Note: "isServer" should be false here, as the device is the server, not us.
+        -   If the event type is 2 and was successful:
+            -   Calls `handleNotification()`:
+                -   If packet is `DiffieHelmanPacket`:
+                    -   `parseServerPublicKey()`:
+                        -   Generate DH shared secret using the public key inside the DH packet, the generated client key, and `mAuthKey`.
+                    -   Set `AuthState.mCalculatedKey` to the shared secret
+                -   ElIf packet is `AuthPacket`:
+                    -   Calls `AuthState.applyReceiveCryptKey()`, which sets `AuthState.mReceiveCryptKey` to `.mCalculatedKey`
+                    -   Calls `sendAuthOk()`, which sends an `AuthResultPacket` with a specific success string to the device via BLE.
