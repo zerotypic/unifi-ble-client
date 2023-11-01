@@ -1,5 +1,5 @@
 #+STARTUP: indent
-#+OPTIONS: toc:nil
+#+OPTIONS: toc:nil ^:nil
 
 * UniFi BLE Protocol
 
@@ -69,13 +69,13 @@ streams.
 
 The layout of an /encrypted packet/ is as follows:
 
-
+#+BEGIN_SRC text
 |------+----------------|
 |    2 | ~              |
 |------+----------------|
 | size | encrypted data |
 |------+----------------|
-
+#+END_SRC
 
 - /size/ (unsigned short) is the total number of bytes forming the encrypted
   packet, including the size field itself.
@@ -88,11 +88,13 @@ Packet encryption and decryption are described later in this document.
 
 The layout of a /plaintext packet/ is as follows:
 
+#+BEGIN_SRC text
 |-----------------+----------+------|
 |               2 |        1 | ~    |
 |-----------------+----------+------|
 | sequence number | protocol | data |
 |-----------------+----------+------|
+#+END_SRC
 
 - /sequence number/ (unsigned short) is the packet's sequence number. The
   protocol enforces ordering of packets using the sequence number.
@@ -271,11 +273,13 @@ layer.
 
 A message part has the following layout:
 
+#+BEGIN_SRC text
 |------+--------+----------+------+--------+------|
 |    1 |      1 |        1 |    1 |      2 | ~    |
 |------+--------+----------+------+--------+------|
 | type | format | compress | NULL | length | data |
 |------+--------+----------+------+--------+------|
+#+END_SRC
 
 - /type/ (byte) is either 1 for header or 2 for body
 - /format/ (byte) indicates the format of /data/ stream:
